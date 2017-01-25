@@ -1,12 +1,11 @@
 {
   "name": "isic-rss",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "RSS module for isic",
   "author": "Christopher Kaster",
   "license": "MIT",
   "dependencies": {
     "feedparser": "^2.1.0",
-    "request": "^2.79.0",
     "stream": "0.0.2"
   }
 }
