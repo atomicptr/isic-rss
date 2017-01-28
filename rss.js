@@ -156,10 +156,6 @@ module.exports = function(bot) {
             }
         }
 
-        for(let server of servers) {
-            checkArticles(server)
-        }
-
-        bot.forEveryUserWithDatabase(user => {if(user) checkArticles(user)})
+        bot.forEveryDatabase((owner, db) => db.getState().isicRssChannelLinks, (owner, db) => checkArticles(owner))
     })
 }
