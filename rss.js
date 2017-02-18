@@ -5,8 +5,8 @@ module.exports = function(bot) {
     function getArticles(link, callback) {
         bot.request(link, (err, response, body) => {
             if(err) {
-                console.error(`ERR: error with connection to ${link}: ${err.name} ${err.message}`)
-                console.error(err)
+                bot.error(`ERR: error with connection to ${link}: ${err.name} ${err.message}`)
+                bot.error(err)
                 return []
             }
 
@@ -15,8 +15,8 @@ module.exports = function(bot) {
             feedparser._articles = []
 
             feedparser.on("error", err => {
-                console.error(`ERR: error with connection to ${link}: ${err.name} ${err.message}`)
-                console.error(err)
+                bot.error(`ERR: error with connection to ${link}: ${err.name} ${err.message}`)
+                bot.error(err)
             })
 
             feedparser.on("readable", function() {
@@ -28,7 +28,7 @@ module.exports = function(bot) {
             })
 
             feedparser.on("end", function() {
-                console.log(`${this._articles.length} articles found on ${link}`)
+                bot.debug(`${this._articles.length} articles found on ${link}`)
                 callback(this._articles)
             })
 
@@ -107,7 +107,7 @@ module.exports = function(bot) {
     })
 
     bot.interval("isic-rss-check", _ => {
-        console.log("checking rss feeds...")
+        bot.log("checking rss feeds...")
 
         let servers = bot.servers
 
