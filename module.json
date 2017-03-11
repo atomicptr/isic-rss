@@ -1,5 +1,5 @@
 {
     "name": "ISIC RSS",
-    "ident": "github.atomicptr.isic-rss",
+    "identifier": "github.atomicptr.isic-rss",
     "main": "rss.js"
 }

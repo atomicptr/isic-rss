@@ -1,63 +1,88 @@
 const FeedParser = require("feedparser")
-const Readable = require("stream").Readable
+const {Readable} = require("stream")
 
 module.exports = function(bot) {
-    function getArticles(link, callback) {
-        bot.request(link, (err, response, body) => {
-            if(err) {
-                bot.error(`ERR: error with connection to ${link}: ${err.name} ${err.message}`)
-                bot.error(err)
-                return []
-            }
-
-            let feedparser = new FeedParser()
-
-            feedparser._articles = []
-
-            feedparser.on("error", err => {
-                bot.error(`ERR: error with connection to ${link}: ${err.name} ${err.message}`)
-                bot.error(err)
-            })
-
-            feedparser.on("readable", function() {
-                let article = null
-
-                while(article = this.read()) {
-                    this._articles.push(article)
-                }
-            })
-
-            feedparser.on("end", function() {
-                bot.debug(`${this._articles.length} articles found on ${link}`)
-                callback(this._articles)
-            })
-
-            // convert string into stream
-            let bodyStream = new Readable()
-            bodyStream._read = function() {}
-            bodyStream.push(body)
-            bodyStream.push(null)
-
-            bodyStream.pipe(feedparser)
-        })
-    }
-
     function identify(article) {
         let ident = article.guid || article.link
         return bot.hash(ident)
     }
 
-    function setupDb(handle) {
-        bot.db(handle).defaults({
-            isicRssChannelLinks: {},
-            isicRssUrlNames: {}
-        }).value()
+    function getArticles(res, siteId) {
+        let promise = new Promise(function(resolve, reject) {
+            res.globalCollection("sites").findOne({_id: siteId}).then(site => {
+                if(!site) {
+                    return reject({message: `Unknown site id: ${siteId}`})
+                }
+
+                // TODO: delete old articles
+                bot.request(site.link, (err, response, body) => {
+                    if(err) {
+                        bot.error(`ERR: error with connection to ${site.link}`)
+                        return reject(err)
+                    }
+
+                    let feedparser = new FeedParser()
+
+                    feedparser._articles = []
+
+                    feedparser.on("error", err => {
+                        bot.error(`ERR: error with connection to ${site.link}`)
+                        return reject(err)
+                    })
+
+                    feedparser.on("readable", function() {
+                        let article = null
+
+                        while(article = this.read()) {
+                            this._articles.push(article)
+                        }
+                    })
+
+                    feedparser.on("end", function() {
+                        bot.debug(`${this._articles.length} articles found on ${site.link}`)
+
+                        let articles = []
+
+                        for(let article of this._articles) {
+                            const articleIdentifier = identify(article)
+
+                            let articleMetaImage = article.meta ? article.meta.image : false
+
+                            let dbarticle = {
+                                ident: articleIdentifier,
+                                url: article.link,
+                                title: article.title,
+                                timestamp: article.pubdate || article.date || new Date().getTime(),
+                                image: articleMetaImage
+                            }
+
+                            articles.push(dbarticle)
+
+                            res.globalCollection("sites").update(
+                                {_id: siteId, "articles.ident": {$ne: articleIdentifier}},
+                                {$push: {articles: dbarticle}}
+                            )
+                        }
+
+                        resolve(articles)
+                    })
+
+                    // convert string into stream
+                    let bodyStream = new Readable()
+                    bodyStream.push(body)
+                    bodyStream.push(null)
+
+                    bodyStream.pipe(feedparser)
+                })
+            }).catch(err => reject(err))
+        })
+
+        promise.catch(err => bot.error(err))
+
+        return promise
     }
 
-    // @BOT rss add URL
     bot.respond(/rss add\s+(https?:\/\/[^\s]+)$/im, res => {
-        setupDb(res)
-
         let url = res.matches[1]
 
         if(!bot.isServerAdministrator(res.server, res.author)) {
@@ -65,22 +90,47 @@ module.exports = function(bot) {
             return
         }
 
-        getArticles(url, articles => {
-            for(let article of articles) {
-                let ident = identify(article)
+        let collectionPromises = [
+            res.collection("rss-channels").updateOne(
+                {channelId: res.channelId}, {
+                    $set: {channelId: res.channelId},
+                    $setOnInsert: {sites: [], processedArticles: []}
+                },
+                {upsert: true}
+            ),
+            res.globalCollection("sites").updateOne(
+                {link: url}, {
+                    $set: {link: url},
+                    $setOnInsert: {articles: []}
+                },
+                {upsert: true}
+            )
+        ]
 
-                bot.db(res).set(`isicRssChannelLinks.${res.channelId}.${bot.hash(url)}.${ident}`, true).value()
-                bot.db(res).set(`isicRssUrlNames.${bot.hash(url)}`, url).value()
-            }
+        Promise.all(collectionPromises).then(_ => {
+            res.collection("rss-channels").findOne({channelId: res.channelId}).then(channel => {
+                res.globalCollection("sites").findOne({link: url}).then(site => {
+                    if(channel.sites.indexOf(site._id) < 0) {
+                        getArticles(res, site._id).then(articles => {
+                            res.collection("rss-channels").update({channelId: res.channelId}, {
+                                $addToSet: {
+                                    sites: site._id,
+                                    processedArticles: {$each: site.articles.concat(articles).map(article => article.ident)}
+                                }
+                            })
 
-            res.send(`Added ${url} to my list, ${articles.length} articles omitted.`)
-        })
+                            res.send(`Added ${url} to my list, ${articles.length} articles omitted.`)
+                        })
+                    } else {
+                        res.reply(`${site.link} is already on my list.`)
+                    }
+                })
+            })
+        }).catch(err => bot.error(err))
     })
 
     // @BOT rss remove URL
     bot.respond(/rss remove\s+(https?:\/\/[^\s]+)$/im, res => {
-        setupDb(res)
-
         let url = res.matches[1]
 
         if(!bot.isServerAdministrator(res.server, res.author)) {
@@ -88,74 +138,91 @@ module.exports = function(bot) {
             return
         }
 
-        let state = bot.db(res).getState()
-        delete state.isicRssChannelLinks[res.channelId][bot.hash(url)]
-        bot.db(res).setState(state)
+        res.globalCollection("sites").findOne({link: url}).then(site => {
+            if(!site) {
+                res.send("I didn't knew that site anyway ¯\\_(ツ)_/¯")
+                return
+            }
 
-        res.send(`Removed ${url} from my list.`)
+            res.collection("rss-channels").update(
+                {channelId: res.channelId},
+                {$pull: {sites: site._id}}
+            ).then(_ => {
+                res.send(`Removed ${url} from my list.`)
+            }).catch(err => bot.error(err))
+        })
     })
 
     bot.respond(/rss list/i, res => {
-        setupDb(res)
+        res.collection("rss-channels").findOne({channelId: res.channelId}).then(channel => {
+            if(!channel) {
+                res.send("No RSS feeds registered in this channel :(")
+                return
+            }
 
-        let sites = bot.db(res).get(`isicRssChannelLinks.${res.channelId}`).value()
-        let names = bot.db(res).get(`isicRssUrlNames`).value()
-
-        let list = Object.keys(sites).map(hash => `* ${names[hash]}`)
-
-        res.send(`Here is a list of all my feeds for this channel:\n\n${list.join("\n")}`)
+            res.globalCollection("sites").find({_id: {$in: channel.sites}}).toArray().then(sites => {
+                let list = sites.map(site => site.link)
+                res.send(`Here is a list of all my feeds for this channel:\n\n${list.join("\n")}`)
+            })
+        })
     })
 
-    bot.interval("isic-rss-check", _ => {
+    bot.interval("isic-rss-check", res => {
         bot.log("checking rss feeds...")
 
-        let servers = bot.servers
+        // collect all site ids, find sites that no one is using and remove them
+        function getAllUsedSites(callback) {
+            res.eachCollection("rss-channels").then(collections => {
+                let promises = collections.map(col => col.find({}).toArray())
 
-        function checkArticles(dbHandle) {
-            setupDb(dbHandle)
+                Promise.all(promises).then(channels => {
+                    let allChannels = [].concat.apply([], channels)
 
-            let channels = bot.db(dbHandle).get("isicRssChannelLinks").value()
-            let urlNames = bot.db(dbHandle).get("isicRssUrlNames").value()
-
-            for(let channelId of Object.keys(channels)) {
-                for(let siteHash of Object.keys(channels[channelId])) {
-                    let hack = (channelId, articleList) => {
-                        return function(articles) {
-                            let cache = {}
-
-                            // mark new articles as unread
-                            for(let article of articles) {
-                                let ident = identify(article)
-
-                                cache[ident] = article
-
-                                let knownArticle = channels[channelId][siteHash][ident] || false
-
-                                if(!knownArticle) {
-                                    bot.db(dbHandle).set(`isicRssChannelLinks.${channelId}.${siteHash}.${ident}`, false).value()
-                                }
-                            }
-
-                            for(let ident of Object.keys(articleList)) {
-                                let alreadyVisited = articleList[ident]
-                                if(!alreadyVisited && cache[ident]) {
-                                    let title = cache[ident].title || ""
-                                    let url = cache[ident].link || ""
-
-                                    bot.sendMessageToChannel(bot.client.channels.get(channelId), `:mailbox_with_mail: ${title} ${url}`).then(message => {
-                                        bot.db(dbHandle).set(`isicRssChannelLinks.${channelId}.${siteHash}.${ident}`, true).value()
-                                    })
-                                }
-                            }
-                        }
-                    }
-
-                    if(siteHash && urlNames[siteHash])
-                        getArticles(urlNames[siteHash], hack(channelId, channels[channelId][siteHash]))
-                }
-            }
+                    callback([].concat.apply([], allChannels.map(ch => ch.sites)).filter((elem, index, $this) => index === $this.indexOf(elem)))
+                })
+            })
         }
 
-        bot.forEveryDatabase((owner, db) => db.getState().isicRssChannelLinks, (owner, db) => checkArticles(owner))
+        getAllUsedSites(sites => {
+            res.globalCollection("sites").find({_id: {$nin: sites}}).toArray().then(toBeDeletedSites => {
+                if(toBeDeletedSites.length === 0) {
+                    bot.debug(`No unused rss feeds found :)`)
+                    return
+                }
+
+                let trash = [].concat.apply([], toBeDeletedSites.map(s => s.articles)).map(a => a.ident)
+
+                bot.debug(`${toBeDeletedSites.length} rss feeds with ${trash.length} articles will be removed...`)
+
+                res.eachCollection("rss-channels", collection => {
+                    collection.update({processedArticles: {$in: trash}}, {$pull: {processedArticles: {$in: trash}}})
+                })
+
+                res.globalCollection("sites").remove({_id: {$nin: sites}})
+            })
+        })
+
+        res.globalCollection("sites").find({}).toArray().then(sites => {
+            let promises = sites.map(site => getArticles(res, site._id))
+
+            Promise.all(promises).then(_ => {
+                res.eachCollection("rss-channels", collection => {
+                    collection.find({}).toArray().then(channels => {
+                        channels.forEach(channel => {
+                            res.globalCollection("sites").find({_id: {$in: channel.sites}}).toArray().then(sites => {
+                                let allArticles = [].concat.apply([], sites.map(site => site.articles))
+                                let newArticles = allArticles.filter(article => channel.processedArticles.indexOf(article.ident) === -1)
+
+                                newArticles.forEach(article => {
+                                    bot.sendMessageToChannel(bot.client.channels.get(channel.channelId), `:mailbox_with_mail: ${article.title} ${article.url}`).then(_ => {
+                                        collection.update({_id: channel._id}, {$addToSet: {processedArticles: article.ident}})
+                                    })
+                                })
+                            })
+                        })
+                    })
+                })
+            })
+        })
     })
 }
